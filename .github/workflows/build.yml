@@ -22,7 +22,7 @@ jobs:
               compileSdk = 35
               defaultConfig {
                   applicationId = "com.example.designeditor"
-                  minSdk = 24
+                  minSdk = 29
                   targetSdk = 35
                   versionCode = 1
                   versionName = "1.0"
@@ -53,7 +53,7 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:label="Design Editor"
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -112,9 +112,14 @@ jobs:
           cat > DesignEditor/app/src/main/java/com/example/designeditor/EditorScreen.kt <<'EOF'
           package com.example.designeditor
 
+          import android.graphics.Bitmap
+          import android.widget.Toast
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
           import androidx.compose.foundation.gestures.awaitEachGesture
           import androidx.compose.foundation.gestures.awaitFirstDown
           import androidx.compose.foundation.gestures.calculateCentroid
@@ -122,40 +127,47 @@ jobs:
           import androidx.compose.foundation.gestures.calculateZoom
           import androidx.compose.foundation.gestures.detectTapGestures
           import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.Column
           import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
           import androidx.compose.foundation.layout.fillMaxSize
           import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.heightIn
           import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
           import androidx.compose.foundation.layout.systemBarsPadding
           import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.FilledTonalButton
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.Surface
           import androidx.compose.material3.Text
           import androidx.compose.material3.TextButton
           import androidx.compose.material3.TextField
           import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
-          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.draw.clip
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.geometry.Size
           import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.graphics.ImageBitmap
-          import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.graphics.drawscope.Stroke
-          import androidx.compose.ui.graphics.drawscope.clipRect
+          import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
           import androidx.compose.ui.graphics.drawscope.rotate
           import androidx.compose.ui.graphics.drawscope.withTransform
-          import androidx.compose.ui.input.pointer.positionChange
+          import androidx.compose.ui.graphics.nativeCanvas
           import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.input.pointer.positionChange
           import androidx.compose.ui.layout.onSizeChanged
-          import androidx.compose.ui.text.AnnotatedString
-          import androidx.compose.ui.text.TextStyle
-          import androidx.compose.ui.text.drawText
-          import androidx.compose.ui.text.rememberTextMeasurer
-          import androidx.compose.ui.unit.Constraints
-          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.unit.IntSize
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
           import androidx.lifecycle.compose.collectAsStateWithLifecycle
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.withContext
@@ -215,31 +227,68 @@ jobs:
               return start.withTransform(x = c.x - nw / 2, y = c.y - nh / 2, w = nw, h = nh)
           }
 
+          /** Roda para o ponto do dedo, com "ímã" a cada 45 graus. */
           private fun rotateTo(start: Element, p: Offset): Element {
               val c = start.center()
               val deg = Math.toDegrees(atan2((p.y - c.y).toDouble(), (p.x - c.x).toDouble())).toFloat() + 90f
-              return start.withTransform(rotation = deg)
+              val r = ((deg % 360f) + 360f) % 360f
+              val near = (r / 45f).roundToInt() * 45f
+              return start.withTransform(rotation = if (abs(r - near) < 4f) near else r)
+          }
+
+          /** Ímã às margens e ao centro da página. Devolve a nova posição e a linha-guia (se houver). */
+          private fun snapAxis(pos: Float, size: Float, page: Float, thr: Float): Pair<Float, Float?> {
+              val cands = listOf(0f to 0f, (page / 2 - size / 2) to (page / 2), (page - size) to page)
+              val best = cands.minByOrNull { abs(it.first - pos) } ?: return pos to null
+              return if (abs(best.first - pos) <= thr) best.first to best.second else pos to null
           }
 
           // ---------- ecrã ----------
+          private val SIZES = listOf(
+              Triple("Quadrado 1080 × 1080", 1080, 1080),
+              Triple("Post 1080 × 1350", 1080, 1350),
+              Triple("Story 1080 × 1920", 1080, 1920),
+              Triple("Paisagem 1920 × 1080", 1920, 1080),
+          )
+
           @Composable
           fun EditorScreen(vm: EditorViewModel) {
               val state by vm.state.collectAsStateWithLifecycle()
+              val context = LocalContext.current
               var editing by remember { mutableStateOf<TextElement?>(null) }
+              var showTemplates by remember { mutableStateOf(false) }
+              var showSizes by remember { mutableStateOf(false) }
               val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
                   if (uri != null) vm.addImage(uri)
               }
 
-              Column(Modifier.fillMaxSize().systemBarsPadding()) {
-                  Row(Modifier.horizontalScroll(rememberScrollState()).padding(4.dp)) {
-                      TextButton(onClick = { vm.undo() }, enabled = state.canUndo) { Text("Desfazer") }
-                      TextButton(onClick = { vm.redo() }, enabled = state.canRedo) { Text("Refazer") }
-                      TextButton(onClick = { vm.addShape() }) { Text("Forma") }
-                      TextButton(onClick = { vm.addText() }) { Text("Texto") }
-                      TextButton(onClick = { picker.launch("image/*") }) { Text("Imagem") }
-                      TextButton(onClick = { vm.deleteSelected() }, enabled = state.selectedId != null) { Text("Apagar") }
+              Column(Modifier.fillMaxSize().background(Color(0xFF121212)).systemBarsPadding()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      TextButton(onClick = { vm.undo() }, enabled = state.canUndo) { Text("↶") }
+                      TextButton(onClick = { vm.redo() }, enabled = state.canRedo) { Text("↷") }
+                      Spacer(Modifier.weight(1f))
+                      TextButton(onClick = { showTemplates = true }) { Text("Modelos") }
+                      TextButton(onClick = { showSizes = true }) { Text("Tamanho") }
+                      Button(onClick = {
+                          vm.exportPng { ok ->
+                              Toast.makeText(
+                                  context,
+                                  if (ok) "PNG salvo em Imagens/DesignEditor" else "Falha ao exportar",
+                                  Toast.LENGTH_LONG,
+                              ).show()
+                          }
+                      }) { Text("Exportar") }
                   }
-                  DesignCanvas(state, vm, onEditText = { editing = it }, modifier = Modifier.weight(1f).fillMaxWidth())
+
+                  DesignCanvas(
+                      state, vm, onEditText = { editing = it },
+                      modifier = Modifier.weight(1f).fillMaxWidth().background(Color(0xFF2B2B2B)),
+                  )
+
+                  BottomPanel(state, vm, onPickImage = { picker.launch("image/*") }, onEditText = { editing = it })
               }
 
               editing?.let { t ->
@@ -247,11 +296,168 @@ jobs:
                   AlertDialog(
                       onDismissRequest = { editing = null },
                       confirmButton = { TextButton(onClick = { vm.updateText(t.id, text); editing = null }) { Text("OK") } },
+                      dismissButton = { TextButton(onClick = { editing = null }) { Text("Cancelar") } },
                       text = { TextField(value = text, onValueChange = { text = it }) },
+                  )
+              }
+
+              if (showTemplates) {
+                  AlertDialog(
+                      onDismissRequest = { showTemplates = false },
+                      confirmButton = { TextButton(onClick = { showTemplates = false }) { Text("Fechar") } },
+                      title = { Text("Modelos") },
+                      text = {
+                          Column {
+                              Templates.all.forEach { (name, build) ->
+                                  TextButton(onClick = { vm.applyTemplate(build()); showTemplates = false }) { Text(name) }
+                              }
+                          }
+                      },
+                  )
+              }
+
+              if (showSizes) {
+                  AlertDialog(
+                      onDismissRequest = { showSizes = false },
+                      confirmButton = { TextButton(onClick = { showSizes = false }) { Text("Fechar") } },
+                      title = { Text("Tamanho da página") },
+                      text = {
+                          Column {
+                              SIZES.forEach { (name, w, h) ->
+                                  TextButton(onClick = { vm.setPageSize(w, h); showSizes = false }) { Text(name) }
+                              }
+                          }
+                      },
                   )
               }
           }
 
+          // ---------- painel de baixo ----------
+          @Composable
+          private fun BottomPanel(state: EditorState, vm: EditorViewModel, onPickImage: () -> Unit, onEditText: (TextElement) -> Unit) {
+              val sel = state.design.elements.firstOrNull { it.id == state.selectedId }
+              Surface(color = Color(0xFF1E1E1E), contentColor = Color.White, modifier = Modifier.fillMaxWidth()) {
+                  Column(
+                      Modifier.heightIn(max = 260.dp).verticalScroll(rememberScrollState()).padding(8.dp),
+                      verticalArrangement = Arrangement.spacedBy(6.dp),
+                  ) {
+                      if (sel == null) {
+                          Row(Modifier.horizontalScroll(rememberScrollState())) {
+                              FilledTonalButton(onClick = { vm.addShape(ShapeKind.RECT) }) { Text("Retângulo") }
+                              Spacer(Modifier.size(6.dp))
+                              FilledTonalButton(onClick = { vm.addShape(ShapeKind.ELLIPSE) }) { Text("Círculo") }
+                              Spacer(Modifier.size(6.dp))
+                              FilledTonalButton(onClick = { vm.addShape(ShapeKind.TRIANGLE) }) { Text("Triângulo") }
+                              Spacer(Modifier.size(6.dp))
+                              FilledTonalButton(onClick = { vm.addText() }) { Text("Texto") }
+                              Spacer(Modifier.size(6.dp))
+                              FilledTonalButton(onClick = onPickImage) { Text("Imagem") }
+                          }
+                          Label("Cor do fundo")
+                          ColorRow(state.design.background) { c -> vm.setBackground(c) }
+                      } else {
+                          PropertiesPanel(sel, vm, onEditText)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Label(text: String) {
+              Text(text, color = Color(0xFFBBBBBB), fontSize = 12.sp)
+          }
+
+          @Composable
+          private fun ColorRow(selected: Long?, onPick: (Long) -> Unit) {
+              Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                  PALETTE.forEach { c ->
+                      val on = c == selected
+                      Box(
+                          Modifier.size(34.dp).clip(CircleShape).background(Color(c))
+                              .border(if (on) 3.dp else 1.dp, if (on) Color(0xFF2979FF) else Color.Gray, CircleShape)
+                              .clickable { onPick(c) }
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun LiveSlider(
+              label: String, value: Float, range: ClosedFloatingPointRange<Float>,
+              vm: EditorViewModel, apply: (Element, Float) -> Element,
+          ) {
+              Label(label)
+              Slider(
+                  value = value.coerceIn(range.start, range.endInclusive),
+                  valueRange = range,
+                  onValueChange = { v -> vm.beginGesture(); vm.liveEdit { e -> apply(e, v) } },
+                  onValueChangeFinished = { vm.endGesture() },
+              )
+          }
+
+          @Composable
+          private fun ToggleBtn(label: String, on: Boolean, onClick: () -> Unit) {
+              if (on) FilledTonalButton(onClick = onClick) { Text(label) }
+              else TextButton(onClick = onClick) { Text(label) }
+          }
+
+          @Composable
+          private fun PropertiesPanel(sel: Element, vm: EditorViewModel, onEditText: (TextElement) -> Unit) {
+              val color: Long? = when (sel) {
+                  is ShapeElement -> sel.color
+                  is TextElement -> sel.color
+                  else -> null
+              }
+              if (color != null) {
+                  Label("Cor")
+                  ColorRow(color) { c ->
+                      vm.edit { e ->
+                          when (e) {
+                              is ShapeElement -> e.copy(color = c)
+                              is TextElement -> e.copy(color = c)
+                              else -> e
+                          }
+                      }
+                  }
+              }
+
+              LiveSlider("Opacidade", sel.opacity, 0.05f..1f, vm) { e, v -> e.withOpacity(v) }
+
+              if (sel is ShapeElement && sel.kind == ShapeKind.RECT) {
+                  LiveSlider("Cantos arredondados", sel.corner, 0f..300f, vm) { e, v ->
+                      if (e is ShapeElement) e.copy(corner = v) else e
+                  }
+              }
+
+              if (sel is TextElement) {
+                  LiveSlider("Tamanho do texto", sel.fontSize, 12f..400f, vm) { e, v ->
+                      if (e is TextElement) e.copy(fontSize = v) else e
+                  }
+                  Row(Modifier.horizontalScroll(rememberScrollState())) {
+                      ToggleBtn("N", sel.bold) { vm.edit { e -> if (e is TextElement) e.copy(bold = !e.bold) else e } }
+                      ToggleBtn("I", sel.italic) { vm.edit { e -> if (e is TextElement) e.copy(italic = !e.italic) else e } }
+                      ToggleBtn("Esq", sel.align == 0) { vm.edit { e -> if (e is TextElement) e.copy(align = 0) else e } }
+                      ToggleBtn("Centro", sel.align == 1) { vm.edit { e -> if (e is TextElement) e.copy(align = 1) else e } }
+                      ToggleBtn("Dir", sel.align == 2) { vm.edit { e -> if (e is TextElement) e.copy(align = 2) else e } }
+                  }
+                  Row(Modifier.horizontalScroll(rememberScrollState())) {
+                      ToggleBtn("Sans", sel.family == "sans") { vm.edit { e -> if (e is TextElement) e.copy(family = "sans") else e } }
+                      ToggleBtn("Serif", sel.family == "serif") { vm.edit { e -> if (e is TextElement) e.copy(family = "serif") else e } }
+                      ToggleBtn("Mono", sel.family == "mono") { vm.edit { e -> if (e is TextElement) e.copy(family = "mono") else e } }
+                      TextButton(onClick = { onEditText(sel) }) { Text("Editar texto") }
+                  }
+              }
+
+              Row(Modifier.horizontalScroll(rememberScrollState())) {
+                  TextButton(onClick = { vm.bringForward() }) { Text("Para frente") }
+                  TextButton(onClick = { vm.sendBackward() }) { Text("Para trás") }
+                  TextButton(onClick = { vm.duplicate() }) { Text("Duplicar") }
+                  TextButton(onClick = { vm.deleteSelected() }) { Text("Apagar", color = Color(0xFFFF6B6B)) }
+                  TextButton(onClick = { vm.select(null) }) { Text("Concluir") }
+              }
+          }
+
+          // ---------- canvas ----------
           @Composable
           private fun DesignCanvas(
               state: EditorState,
@@ -260,19 +466,19 @@ jobs:
               modifier: Modifier,
           ) {
               val design = state.design
-              val measurer = rememberTextMeasurer()
-              val images = remember { mutableStateMapOf<String, ImageBitmap>() }
+              val images = remember { mutableStateMapOf<String, Bitmap>() }
               var zoom by remember { mutableFloatStateOf(1f) }
               var offset by remember { mutableStateOf(Offset.Zero) }
               var size by remember { mutableStateOf(IntSize.Zero) }
+              var guides by remember { mutableStateOf(listOf<Pair<Boolean, Float>>()) }  // (vertical?, coordenada)
               val latest by rememberUpdatedState(state)
 
               fun toDoc(p: Offset) = (p - offset) / zoom
 
-              // Ajusta a página ao ecrã quando o tamanho é conhecido.
+              // Ajusta a página ao ecrã quando o tamanho é conhecido ou muda.
               LaunchedEffect(size, design.width, design.height) {
                   if (size.width > 0 && size.height > 0) {
-                      val z = min(size.width / design.width.toFloat(), size.height / design.height.toFloat()) * 0.9f
+                      val z = min(size.width / design.width.toFloat(), size.height / design.height.toFloat()) * 0.92f
                       zoom = z
                       offset = Offset((size.width - design.width * z) / 2, (size.height - design.height * z) / 2)
                   }
@@ -283,7 +489,7 @@ jobs:
                   design.elements.filterIsInstance<ImageElement>().map { it.path }
                       .filter { it !in images }
                       .forEach { p ->
-                          withContext(Dispatchers.IO) { decodeScaled(p) }?.let { images[p] = it.asImageBitmap() }
+                          withContext(Dispatchers.IO) { decodeScaled(p) }?.let { images[p] = it }
                       }
               }
 
@@ -312,6 +518,7 @@ jobs:
                               val selected = cur.design.elements.firstOrNull { it.id == cur.selectedId }
                               val hitR = 22.dp.toPx() / zoom
                               val rotDist = 28.dp.toPx() / zoom
+                              val snapThr = 8.dp.toPx() / zoom
                               val handle = selected?.let { s ->
                                   handlePositions(s, rotDist).entries
                                       .firstOrNull { (it.value - startDoc).getDistance() <= hitR }?.key
@@ -351,12 +558,21 @@ jobs:
                                           val p = toDoc(c.position)
                                           when (drag) {
                                               Drag.Pan -> offset += delta
-                                              is Drag.Move -> vm.liveUpdate(
-                                                  drag.start.withTransform(
-                                                      x = drag.start.x + total.x / zoom,
-                                                      y = drag.start.y + total.y / zoom,
+                                              is Drag.Move -> {
+                                                  val (sx, gx) = snapAxis(
+                                                      drag.start.x + total.x / zoom, drag.start.w,
+                                                      cur.design.width.toFloat(), snapThr,
                                                   )
-                                              )
+                                                  val (sy, gy) = snapAxis(
+                                                      drag.start.y + total.y / zoom, drag.start.h,
+                                                      cur.design.height.toFloat(), snapThr,
+                                                  )
+                                                  guides = listOfNotNull(
+                                                      gx?.let { true to it },
+                                                      gy?.let { false to it },
+                                                  )
+                                                  vm.liveUpdate(drag.start.withTransform(x = sx, y = sy))
+                                              }
                                               is Drag.Handle -> vm.liveUpdate(
                                                   if (drag.type == HandleType.ROTATE) rotateTo(drag.start, p)
                                                   else resize(drag.start, drag.type, p)
@@ -366,48 +582,34 @@ jobs:
                                       }
                                   }
                               } while (event.changes.any { it.pressed })
+                              guides = emptyList()
                               if (begun) vm.endGesture()
                           }
                       }
               ) {
                   val selected = design.elements.firstOrNull { it.id == state.selectedId }
+
+                  // Página e elementos: o mesmo desenhador que exporta o PNG.
+                  drawIntoCanvas { canvas ->
+                      val nc = canvas.nativeCanvas
+                      nc.save()
+                      nc.translate(offset.x, offset.y)
+                      nc.scale(zoom, zoom)
+                      Renderer.draw(nc, design) { images[it] }
+                      nc.restore()
+                  }
+
+                  // Seleção, alças e guias (tamanho constante no ecrã).
                   withTransform({
                       translate(offset.x, offset.y)
                       scale(zoom, zoom, Offset.Zero)
                   }) {
-                      drawRect(Color.White, Offset.Zero, Size(design.width.toFloat(), design.height.toFloat()))
-
-                      // Elementos recortados à página; a ordem da lista é o z-index.
-                      clipRect(0f, 0f, design.width.toFloat(), design.height.toFloat()) {
-                          for (e in design.elements) {
-                              rotate(e.rotation, pivot = e.center()) {
-                                  when (e) {
-                                      is ShapeElement -> drawRoundRect(
-                                          Color(e.color), Offset(e.x, e.y), Size(e.w, e.h), CornerRadius(e.corner)
-                                      )
-                                      is TextElement -> {
-                                          val layout = measurer.measure(
-                                              text = AnnotatedString(e.text),
-                                              style = TextStyle(fontSize = e.fontSize.toSp(), color = Color(e.color)),
-                                              constraints = Constraints(maxWidth = e.w.roundToInt().coerceAtLeast(1)),
-                                          )
-                                          drawText(layout, topLeft = Offset(e.x, e.y))
-                                      }
-                                      is ImageElement -> images[e.path]?.let {
-                                          drawImage(
-                                              it,
-                                              dstOffset = IntOffset(e.x.roundToInt(), e.y.roundToInt()),
-                                              dstSize = IntSize(e.w.roundToInt(), e.h.roundToInt()),
-                                          )
-                                      }
-                                  }
-                              }
-                          }
+                      val stroke = 2.dp.toPx() / zoom
+                      guides.forEach { (vertical, pos) ->
+                          if (vertical) drawLine(Color(0xFFFF4081), Offset(pos, 0f), Offset(pos, design.height.toFloat()), stroke)
+                          else drawLine(Color(0xFFFF4081), Offset(0f, pos), Offset(design.width.toFloat(), pos), stroke)
                       }
-
-                      // Seleção e alças (fora do recorte, com tamanho constante no ecrã).
                       selected?.let { s ->
-                          val stroke = 2.dp.toPx() / zoom
                           val rotDist = 28.dp.toPx() / zoom
                           val blue = Color(0xFF2979FF)
                           rotate(s.rotation, pivot = s.center()) {
@@ -429,8 +631,12 @@ jobs:
           package com.example.designeditor
 
           import android.app.Application
+          import android.content.ContentValues
+          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
+          import android.graphics.Canvas
           import android.net.Uri
+          import android.provider.MediaStore
           import androidx.lifecycle.AndroidViewModel
           import androidx.lifecycle.viewModelScope
           import kotlinx.coroutines.Dispatchers
@@ -468,19 +674,24 @@ jobs:
               }
 
               private val design get() = _state.value.design
+              private val selected: Element?
+                  get() = _state.value.let { s -> s.design.elements.firstOrNull { it.id == s.selectedId } }
+
+              /** Texto: ajusta a altura da caixa ao conteúdo. */
+              private fun fit(e: Element): Element = if (e is TextElement) e.copy(h = Renderer.fitHeight(e)) else e
 
               // ---------- histórico ----------
-              private fun publish(d: Design, selected: String?) {
-                  _state.value = EditorState(d, selected, undoStack.isNotEmpty(), redoStack.isNotEmpty())
+              private fun publish(d: Design, selectedId: String?) {
+                  _state.value = EditorState(d, selectedId, undoStack.isNotEmpty(), redoStack.isNotEmpty())
                   scheduleSave()
               }
 
               /** Alteração discreta: guarda o estado anterior no histórico. */
-              private fun commit(newDesign: Design, selected: String? = _state.value.selectedId) {
+              private fun commit(newDesign: Design, selectedId: String? = _state.value.selectedId) {
                   undoStack.addLast(design)
                   if (undoStack.size > 100) undoStack.removeFirst()
                   redoStack.clear()
-                  publish(newDesign, selected)
+                  publish(newDesign, selectedId)
               }
 
               fun undo() {
@@ -495,39 +706,51 @@ jobs:
                   publish(next, _state.value.selectedId?.takeIf { id -> next.elements.any { it.id == id } })
               }
 
-              // ---------- gestos (arrastar/redimensionar/rodar) ----------
-              fun beginGesture() { gestureStart = design }
+              // ---------- gestos e sliders (alterações contínuas) ----------
+              fun beginGesture() { if (gestureStart == null) gestureStart = design }
 
-              /** Atualização em tempo real durante o gesto: sem histórico e sem gravar. */
+              /** Atualização em tempo real: sem histórico e sem gravar. */
               fun liveUpdate(e: Element) {
                   _state.update { s ->
                       s.copy(design = s.design.copy(elements = s.design.elements.map { if (it.id == e.id) e else it }))
                   }
               }
 
+              /** Altera o elemento selecionado em tempo real (usado pelos sliders). */
+              fun liveEdit(t: (Element) -> Element) {
+                  val e = selected ?: return
+                  liveUpdate(fit(t(e)))
+              }
+
               /** Quando o dedo levanta, o gesto inteiro vira UM passo de undo. */
               fun endGesture() {
                   val start = gestureStart ?: return
                   gestureStart = null
-                  if (start != design) {
+                  val sel = _state.value.selectedId
+                  val d = design.copy(elements = design.elements.map { if (it.id == sel) fit(it) else it })
+                  if (start != d) {
                       undoStack.addLast(start)
                       redoStack.clear()
-                      publish(design, _state.value.selectedId)
+                      publish(d, sel)
+                  } else {
+                      _state.update { it.copy(design = d) }
                   }
               }
 
               // ---------- ações ----------
               fun select(id: String?) { _state.update { it.copy(selectedId = id) } }
 
-              fun addShape() {
+              fun addShape(kind: ShapeKind) {
                   val d = design
-                  val s = ShapeElement(newId(), (d.width - 400) / 2f, (d.height - 400) / 2f, 400f, 400f, color = 0xFF6200EE, corner = 24f)
+                  val s = ShapeElement(newId(), (d.width - 400) / 2f, (d.height - 400) / 2f, 400f, 400f,
+                      kind = kind, color = 0xFF1E88E5, corner = if (kind == ShapeKind.RECT) 24f else 0f)
                   commit(d.copy(elements = d.elements + s), s.id)
               }
 
               fun addText() {
                   val d = design
-                  val t = TextElement(newId(), (d.width - 600) / 2f, (d.height - 100) / 2f, 600f, 100f, text = "Texto")
+                  val t0 = TextElement(newId(), (d.width - 700) / 2f, (d.height - 100) / 2f, 700f, 100f, text = "Toque duas vezes para editar")
+                  val t = t0.copy(h = Renderer.fitHeight(t0))
                   commit(d.copy(elements = d.elements + t), t.id)
               }
 
@@ -550,14 +773,72 @@ jobs:
                   }
               }
 
+              /** Alteração discreta no elemento selecionado (cor, negrito, alinhamento...). */
+              fun edit(t: (Element) -> Element) {
+                  val id = _state.value.selectedId ?: return
+                  commit(design.copy(elements = design.elements.map { if (it.id == id) fit(t(it)) else it }))
+              }
+
               fun updateText(id: String, text: String) {
-                  val d = design
-                  commit(d.copy(elements = d.elements.map { if (it.id == id && it is TextElement) it.copy(text = text) else it }))
+                  commit(design.copy(elements = design.elements.map {
+                      if (it.id == id && it is TextElement) fit(it.copy(text = text)) else it
+                  }))
               }
 
               fun deleteSelected() {
                   val id = _state.value.selectedId ?: return
                   commit(design.copy(elements = design.elements.filterNot { it.id == id }), null)
+              }
+
+              fun duplicate() {
+                  val e = selected ?: return
+                  val c = e.duplicated()
+                  commit(design.copy(elements = design.elements + c), c.id)
+              }
+
+              fun bringForward() = moveLayer(+1)
+              fun sendBackward() = moveLayer(-1)
+
+              private fun moveLayer(delta: Int) {
+                  val id = _state.value.selectedId ?: return
+                  val list = design.elements.toMutableList()
+                  val i = list.indexOfFirst { it.id == id }
+                  val j = i + delta
+                  if (i < 0 || j < 0 || j >= list.size) return
+                  val e = list.removeAt(i)
+                  list.add(j, e)
+                  commit(design.copy(elements = list))
+              }
+
+              fun setBackground(color: Long) { commit(design.copy(background = color)) }
+
+              fun setPageSize(w: Int, h: Int) { commit(design.copy(width = w, height = h)) }
+
+              fun applyTemplate(d: Design) { commit(d.copy(id = design.id), null) }
+
+              // ---------- exportar PNG para a galeria ----------
+              fun exportPng(onDone: (Boolean) -> Unit) {
+                  val d = design
+                  viewModelScope.launch(Dispatchers.IO) {
+                      val ok = runCatching {
+                          val bitmaps = HashMap<String, Bitmap?>()
+                          d.elements.filterIsInstance<ImageElement>().forEach { bitmaps[it.path] = decodeScaled(it.path, 4096) }
+                          val bmp = Bitmap.createBitmap(d.width, d.height, Bitmap.Config.ARGB_8888)
+                          Renderer.draw(Canvas(bmp), d) { bitmaps[it] }
+                          val values = ContentValues().apply {
+                              put(MediaStore.Images.Media.DISPLAY_NAME, "design_${System.currentTimeMillis()}.png")
+                              put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                              put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DesignEditor")
+                          }
+                          val uri = app.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                              ?: error("sem uri")
+                          val saved = app.contentResolver.openOutputStream(uri)?.use { out ->
+                              bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                          } ?: false
+                          saved
+                      }.getOrDefault(false)
+                      withContext(Dispatchers.Main) { onDone(ok) }
+                  }
               }
 
               // ---------- persistência ----------
@@ -581,13 +862,14 @@ jobs:
           import androidx.activity.compose.setContent
           import androidx.activity.viewModels
           import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
 
           class MainActivity : ComponentActivity() {
               private val vm: EditorViewModel by viewModels()
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  setContent { MaterialTheme { EditorScreen(vm) } }
+                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { EditorScreen(vm) } }
               }
 
               override fun onStop() {
@@ -606,7 +888,13 @@ jobs:
 
           fun newId(): String = UUID.randomUUID().toString()
 
-          /** Todos os elementos partilham a mesma geometria: caixa (x, y, w, h) + rotação em graus. */
+          val PALETTE = listOf<Long>(
+              0xFF000000, 0xFFFFFFFF, 0xFFE53935, 0xFFFB8C00, 0xFFFDD835, 0xFF43A047,
+              0xFF00ACC1, 0xFF1E88E5, 0xFF5E35B1, 0xFFD81B60, 0xFF8D6E63, 0xFF607D8B,
+          )
+
+          enum class ShapeKind { RECT, ELLIPSE, TRIANGLE }
+
           @Serializable
           sealed interface Element {
               val id: String
@@ -615,44 +903,61 @@ jobs:
               val w: Float
               val h: Float
               val rotation: Float
+              val opacity: Float
 
               fun withTransform(
                   x: Float = this.x, y: Float = this.y,
                   w: Float = this.w, h: Float = this.h,
                   rotation: Float = this.rotation,
               ): Element
+
+              fun withOpacity(o: Float): Element
+              fun duplicated(): Element
           }
 
           @Serializable @SerialName("shape")
           data class ShapeElement(
               override val id: String, override val x: Float, override val y: Float,
               override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              override val opacity: Float = 1f,
+              val kind: ShapeKind = ShapeKind.RECT,
               val color: Long = 0xFF6200EE, val corner: Float = 0f,
           ) : Element {
               override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
                   copy(x = x, y = y, w = w, h = h, rotation = rotation)
+              override fun withOpacity(o: Float) = copy(opacity = o)
+              override fun duplicated() = copy(id = newId(), x = x + 40f, y = y + 40f)
           }
 
           @Serializable @SerialName("text")
           data class TextElement(
               override val id: String, override val x: Float, override val y: Float,
               override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              override val opacity: Float = 1f,
               val text: String, val fontSize: Float = 64f, val color: Long = 0xFF000000,
+              val bold: Boolean = false, val italic: Boolean = false,
+              val align: Int = 0,            // 0 esquerda, 1 centro, 2 direita
+              val family: String = "sans",   // sans, serif, mono
           ) : Element {
               // Ao redimensionar a altura, o tamanho da fonte acompanha.
               override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
                   copy(x = x, y = y, w = w, h = h, rotation = rotation,
                       fontSize = if (h != this.h && this.h > 0f) fontSize * h / this.h else fontSize)
+              override fun withOpacity(o: Float) = copy(opacity = o)
+              override fun duplicated() = copy(id = newId(), x = x + 40f, y = y + 40f)
           }
 
           @Serializable @SerialName("image")
           data class ImageElement(
               override val id: String, override val x: Float, override val y: Float,
               override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              override val opacity: Float = 1f,
               val path: String,
           ) : Element {
               override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
                   copy(x = x, y = y, w = w, h = h, rotation = rotation)
+              override fun withOpacity(o: Float) = copy(opacity = o)
+              override fun duplicated() = copy(id = newId(), x = x + 40f, y = y + 40f)
           }
 
           /** A ordem da lista é o z-index (o último fica por cima). */
@@ -661,9 +966,172 @@ jobs:
               val id: String = "default",
               val width: Int = 1080,
               val height: Int = 1080,
+              val background: Long = 0xFFFFFFFF,
               val elements: List<Element> = emptyList(),
-              val version: Int = 1,
+              val version: Int = 2,
           )
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/Renderer.kt <<'EOF'
+          package com.example.designeditor
+
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.text.Layout
+          import android.text.StaticLayout
+          import android.text.TextPaint
+          import kotlin.math.roundToInt
+
+          /** Um único desenhador, usado no ecrã e na exportação (o PNG sai igual ao que se vê). */
+          object Renderer {
+
+              fun textLayout(e: TextElement, paint: TextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)): StaticLayout {
+                  paint.textSize = e.fontSize
+                  paint.color = e.color.toInt()
+                  paint.alpha = (e.opacity * 255).roundToInt().coerceIn(0, 255)
+                  val name = when (e.family) {
+                      "serif" -> "serif"
+                      "mono" -> "monospace"
+                      else -> "sans-serif"
+                  }
+                  val style = (if (e.bold) Typeface.BOLD else 0) or (if (e.italic) Typeface.ITALIC else 0)
+                  paint.typeface = Typeface.create(name, style)
+                  val align = when (e.align) {
+                      1 -> Layout.Alignment.ALIGN_CENTER
+                      2 -> Layout.Alignment.ALIGN_OPPOSITE
+                      else -> Layout.Alignment.ALIGN_NORMAL
+                  }
+                  val width = e.w.toInt().coerceAtLeast(1)
+                  return StaticLayout.Builder.obtain(e.text, 0, e.text.length, paint, width)
+                      .setAlignment(align)
+                      .setIncludePad(false)
+                      .build()
+              }
+
+              /** Altura que o texto realmente ocupa, para a caixa de seleção ficar justa. */
+              fun fitHeight(e: TextElement): Float =
+                  textLayout(e).height.toFloat().coerceAtLeast(e.fontSize)
+
+              fun draw(c: Canvas, d: Design, bitmap: (String) -> Bitmap?) {
+                  val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+                  val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+                  val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+                  fill.color = d.background.toInt()
+                  c.drawRect(0f, 0f, d.width.toFloat(), d.height.toFloat(), fill)
+
+                  c.save()
+                  c.clipRect(0f, 0f, d.width.toFloat(), d.height.toFloat())
+                  for (e in d.elements) {
+                      c.save()
+                      c.rotate(e.rotation, e.x + e.w / 2, e.y + e.h / 2)
+                      val alpha = (e.opacity * 255).roundToInt().coerceIn(0, 255)
+                      when (e) {
+                          is ShapeElement -> {
+                              fill.color = e.color.toInt()
+                              fill.alpha = alpha
+                              val r = RectF(e.x, e.y, e.x + e.w, e.y + e.h)
+                              when (e.kind) {
+                                  ShapeKind.RECT -> c.drawRoundRect(r, e.corner, e.corner, fill)
+                                  ShapeKind.ELLIPSE -> c.drawOval(r, fill)
+                                  ShapeKind.TRIANGLE -> {
+                                      val p = Path()
+                                      p.moveTo(e.x + e.w / 2, e.y)
+                                      p.lineTo(e.x + e.w, e.y + e.h)
+                                      p.lineTo(e.x, e.y + e.h)
+                                      p.close()
+                                      c.drawPath(p, fill)
+                                  }
+                              }
+                          }
+                          is TextElement -> {
+                              val layout = textLayout(e, textPaint)
+                              c.save()
+                              c.translate(e.x, e.y)
+                              layout.draw(c)
+                              c.restore()
+                          }
+                          is ImageElement -> {
+                              val bmp = bitmap(e.path)
+                              if (bmp != null) {
+                                  bmpPaint.alpha = alpha
+                                  c.drawBitmap(bmp, null, RectF(e.x, e.y, e.x + e.w, e.y + e.h), bmpPaint)
+                              }
+                          }
+                      }
+                      c.restore()
+                  }
+                  c.restore()
+              }
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/Templates.kt <<'EOF'
+          package com.example.designeditor
+
+          object Templates {
+
+              private fun text(
+                  t: String, x: Float, y: Float, w: Float, size: Float, color: Long,
+                  bold: Boolean = false, align: Int = 0, family: String = "sans",
+              ): TextElement {
+                  val e = TextElement(newId(), x, y, w, 100f, text = t, fontSize = size, color = color,
+                      bold = bold, align = align, family = family)
+                  return e.copy(h = Renderer.fitHeight(e))
+              }
+
+              private fun shape(kind: ShapeKind, x: Float, y: Float, w: Float, h: Float, color: Long, corner: Float = 0f) =
+                  ShapeElement(newId(), x, y, w, h, kind = kind, color = color, corner = corner)
+
+              val all: List<Pair<String, () -> Design>> = listOf(
+                  "Em branco" to { Design() },
+
+                  "Título" to {
+                      Design(
+                          background = 0xFF1A237E,
+                          elements = listOf(
+                              shape(ShapeKind.ELLIPSE, 640f, -120f, 640f, 640f, 0xFFFFC107),
+                              shape(ShapeKind.RECT, 80f, 330f, 140f, 12f, 0xFFFFC107),
+                              text("TÍTULO\nIMPACTANTE", 80f, 380f, 920f, 110f, 0xFFFFFFFF, bold = true),
+                              text("Seu subtítulo aqui", 80f, 740f, 920f, 48f, 0xFFFFC107),
+                          ),
+                      )
+                  },
+
+                  "Promoção (story)" to {
+                      Design(
+                          width = 1080, height = 1920, background = 0xFFFFEBEE,
+                          elements = listOf(
+                              shape(ShapeKind.RECT, 0f, 0f, 1080f, 520f, 0xFFE53935),
+                              text("SUPER\nPROMOÇÃO", 40f, 130f, 1000f, 140f, 0xFFFFFFFF, bold = true, align = 1),
+                              shape(ShapeKind.ELLIPSE, 240f, 700f, 600f, 600f, 0xFFFDD835),
+                              text("50%", 240f, 830f, 600f, 240f, 0xFF000000, bold = true, align = 1),
+                              text("OFF", 240f, 1090f, 600f, 90f, 0xFF000000, bold = true, align = 1),
+                              shape(ShapeKind.RECT, 190f, 1500f, 700f, 150f, 0xFF43A047, corner = 75f),
+                              text("COMPRE AGORA", 190f, 1540f, 700f, 64f, 0xFFFFFFFF, bold = true, align = 1),
+                          ),
+                      )
+                  },
+
+                  "Citação (post)" to {
+                      Design(
+                          width = 1080, height = 1350, background = 0xFFFFF8E1,
+                          elements = listOf(
+                              text("“", 80f, 100f, 300f, 360f, 0xFFFB8C00, bold = true, family = "serif"),
+                              text("A criatividade é a inteligência se divertindo.", 90f, 480f, 900f, 80f,
+                                  0xFF3E2723, family = "serif"),
+                              shape(ShapeKind.RECT, 90f, 900f, 120f, 8f, 0xFFFB8C00),
+                              text("Autor da frase", 90f, 940f, 900f, 44f, 0xFF8D6E63),
+                          ),
+                      )
+                  },
+              )
+
+          }
           EOF
           mkdir -p DesignEditor
           cat > DesignEditor/build.gradle.kts <<'EOF'
