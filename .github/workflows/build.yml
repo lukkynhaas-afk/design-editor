@@ -1,0 +1,708 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p DesignEditor/app
+          cat > DesignEditor/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("org.jetbrains.kotlin.plugin.serialization")
+          }
+
+          android {
+              namespace = "com.example.designeditor"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.designeditor"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main
+          cat > DesignEditor/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:label="Design Editor"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/DesignStorage.kt <<'EOF'
+          package com.example.designeditor
+
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import kotlinx.serialization.json.Json
+          import java.io.File
+          import kotlin.math.max
+
+          class DesignStorage(private val dir: File) {
+              private val json = Json {
+                  prettyPrint = true
+                  ignoreUnknownKeys = true
+                  classDiscriminator = "type"
+              }
+
+              private fun file(id: String) = File(dir, "$id.json")
+
+              /** Escreve num ficheiro temporário e só depois substitui, para nunca deixar JSON a meio. */
+              suspend fun save(design: Design) = withContext(Dispatchers.IO) {
+                  val tmp = File(dir, "${design.id}.tmp")
+                  tmp.writeText(json.encodeToString(Design.serializer(), design))
+                  tmp.renameTo(file(design.id))
+              }
+
+              suspend fun load(id: String): Design? = withContext(Dispatchers.IO) {
+                  val f = file(id)
+                  if (!f.exists()) null
+                  else runCatching { json.decodeFromString(Design.serializer(), f.readText()) }.getOrNull()
+              }
+          }
+
+          /** Decodifica a imagem já reduzida para não rebentar a memória com fotos grandes. */
+          fun decodeScaled(path: String, maxSide: Int = 2048): Bitmap? {
+              val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+              BitmapFactory.decodeFile(path, bounds)
+              if (bounds.outWidth <= 0) return null
+              var sample = 1
+              while (max(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
+              return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/EditorScreen.kt <<'EOF'
+          package com.example.designeditor
+
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.gestures.awaitEachGesture
+          import androidx.compose.foundation.gestures.awaitFirstDown
+          import androidx.compose.foundation.gestures.calculateCentroid
+          import androidx.compose.foundation.gestures.calculatePan
+          import androidx.compose.foundation.gestures.calculateZoom
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.systemBarsPadding
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TextField
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.graphics.drawscope.clipRect
+          import androidx.compose.ui.graphics.drawscope.rotate
+          import androidx.compose.ui.graphics.drawscope.withTransform
+          import androidx.compose.ui.input.pointer.consume
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.onSizeChanged
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.drawText
+          import androidx.compose.ui.text.rememberTextMeasurer
+          import androidx.compose.ui.unit.Constraints
+          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.unit.IntSize
+          import androidx.compose.ui.unit.dp
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import kotlin.math.abs
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+
+          private const val MIN_SIZE = 40f
+
+          private enum class HandleType { TL, TR, BR, BL, ROTATE }
+
+          private sealed interface Drag {
+              data object Pan : Drag
+              data class Move(val start: Element) : Drag
+              data class Handle(val type: HandleType, val start: Element) : Drag
+          }
+
+          // ---------- geometria (tudo em coordenadas do documento) ----------
+          private fun rot(v: Offset, deg: Float): Offset {
+              val r = Math.toRadians(deg.toDouble())
+              val c = cos(r).toFloat(); val s = sin(r).toFloat()
+              return Offset(v.x * c - v.y * s, v.x * s + v.y * c)
+          }
+
+          private fun Element.center() = Offset(x + w / 2, y + h / 2)
+          private fun Element.toLocal(p: Offset) = rot(p - center(), -rotation)
+          private fun Element.hit(p: Offset): Boolean {
+              val l = toLocal(p)
+              return abs(l.x) <= w / 2 && abs(l.y) <= h / 2
+          }
+
+          private fun handlePositions(e: Element, rotateDist: Float): Map<HandleType, Offset> {
+              fun at(lx: Float, ly: Float) = e.center() + rot(Offset(lx, ly), e.rotation)
+              return mapOf(
+                  HandleType.TL to at(-e.w / 2, -e.h / 2),
+                  HandleType.TR to at(e.w / 2, -e.h / 2),
+                  HandleType.BR to at(e.w / 2, e.h / 2),
+                  HandleType.BL to at(-e.w / 2, e.h / 2),
+                  HandleType.ROTATE to at(0f, -e.h / 2 - rotateDist),
+              )
+          }
+
+          /** O canto oposto fica fixo; funciona também com o elemento rodado. */
+          private fun resize(start: Element, type: HandleType, p: Offset): Element {
+              val sx = if (type == HandleType.TR || type == HandleType.BR) 1f else -1f
+              val sy = if (type == HandleType.BR || type == HandleType.BL) 1f else -1f
+              val l = start.toLocal(p)
+              val fx = -sx * start.w / 2
+              val fy = -sy * start.h / 2
+              val nw = max(MIN_SIZE, (l.x - fx) * sx)
+              val nh = max(MIN_SIZE, (l.y - fy) * sy)
+              val c = start.center() + rot(Offset(fx + sx * nw / 2, fy + sy * nh / 2), start.rotation)
+              return start.withTransform(x = c.x - nw / 2, y = c.y - nh / 2, w = nw, h = nh)
+          }
+
+          private fun rotateTo(start: Element, p: Offset): Element {
+              val c = start.center()
+              val deg = Math.toDegrees(atan2((p.y - c.y).toDouble(), (p.x - c.x).toDouble())).toFloat() + 90f
+              return start.withTransform(rotation = deg)
+          }
+
+          // ---------- ecrã ----------
+          @Composable
+          fun EditorScreen(vm: EditorViewModel) {
+              val state by vm.state.collectAsStateWithLifecycle()
+              var editing by remember { mutableStateOf<TextElement?>(null) }
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) vm.addImage(uri)
+              }
+
+              Column(Modifier.fillMaxSize().systemBarsPadding()) {
+                  Row(Modifier.horizontalScroll(rememberScrollState()).padding(4.dp)) {
+                      TextButton(onClick = { vm.undo() }, enabled = state.canUndo) { Text("Desfazer") }
+                      TextButton(onClick = { vm.redo() }, enabled = state.canRedo) { Text("Refazer") }
+                      TextButton(onClick = { vm.addShape() }) { Text("Forma") }
+                      TextButton(onClick = { vm.addText() }) { Text("Texto") }
+                      TextButton(onClick = { picker.launch("image/*") }) { Text("Imagem") }
+                      TextButton(onClick = { vm.deleteSelected() }, enabled = state.selectedId != null) { Text("Apagar") }
+                  }
+                  DesignCanvas(state, vm, onEditText = { editing = it }, modifier = Modifier.weight(1f).fillMaxWidth())
+              }
+
+              editing?.let { t ->
+                  var text by remember(t.id) { mutableStateOf(t.text) }
+                  AlertDialog(
+                      onDismissRequest = { editing = null },
+                      confirmButton = { TextButton(onClick = { vm.updateText(t.id, text); editing = null }) { Text("OK") } },
+                      text = { TextField(value = text, onValueChange = { text = it }) },
+                  )
+              }
+          }
+
+          @Composable
+          private fun DesignCanvas(
+              state: EditorState,
+              vm: EditorViewModel,
+              onEditText: (TextElement) -> Unit,
+              modifier: Modifier,
+          ) {
+              val design = state.design
+              val measurer = rememberTextMeasurer()
+              val images = remember { mutableStateMapOf<String, ImageBitmap>() }
+              var zoom by remember { mutableFloatStateOf(1f) }
+              var offset by remember { mutableStateOf(Offset.Zero) }
+              var size by remember { mutableStateOf(IntSize.Zero) }
+              val latest by rememberUpdatedState(state)
+
+              fun toDoc(p: Offset) = (p - offset) / zoom
+
+              // Ajusta a página ao ecrã quando o tamanho é conhecido.
+              LaunchedEffect(size, design.width, design.height) {
+                  if (size.width > 0 && size.height > 0) {
+                      val z = min(size.width / design.width.toFloat(), size.height / design.height.toFloat()) * 0.9f
+                      zoom = z
+                      offset = Offset((size.width - design.width * z) / 2, (size.height - design.height * z) / 2)
+                  }
+              }
+
+              // Carrega imagens em segundo plano.
+              LaunchedEffect(design.elements) {
+                  design.elements.filterIsInstance<ImageElement>().map { it.path }
+                      .filter { it !in images }
+                      .forEach { p ->
+                          withContext(Dispatchers.IO) { decodeScaled(p) }?.let { images[p] = it.asImageBitmap() }
+                      }
+              }
+
+              Canvas(
+                  modifier
+                      .onSizeChanged { size = it }
+                      // Toque simples = selecionar; duplo toque num texto = editar.
+                      .pointerInput(Unit) {
+                          detectTapGestures(
+                              onTap = { pos ->
+                                  val p = toDoc(pos)
+                                  vm.select(latest.design.elements.lastOrNull { it.hit(p) }?.id)
+                              },
+                              onDoubleTap = { pos ->
+                                  val p = toDoc(pos)
+                                  (latest.design.elements.lastOrNull { it.hit(p) } as? TextElement)?.let(onEditText)
+                              },
+                          )
+                      }
+                      // Arrastar / alças / pinça.
+                      .pointerInput(Unit) {
+                          awaitEachGesture {
+                              val down = awaitFirstDown(requireUnconsumed = false)
+                              val startDoc = toDoc(down.position)
+                              val cur = latest
+                              val selected = cur.design.elements.firstOrNull { it.id == cur.selectedId }
+                              val hitR = 22.dp.toPx() / zoom
+                              val rotDist = 28.dp.toPx() / zoom
+                              val handle = selected?.let { s ->
+                                  handlePositions(s, rotDist).entries
+                                      .firstOrNull { (it.value - startDoc).getDistance() <= hitR }?.key
+                              }
+                              val drag: Drag = when {
+                                  selected != null && handle != null -> Drag.Handle(handle, selected)
+                                  selected != null && selected.hit(startDoc) -> Drag.Move(selected)
+                                  else -> Drag.Pan
+                              }
+
+                              var total = Offset.Zero
+                              var active = false
+                              var begun = false
+                              var multi = false
+                              do {
+                                  val event = awaitPointerEvent()
+                                  val pressed = event.changes.filter { it.pressed }
+                                  if (pressed.size >= 2) {
+                                      multi = true
+                                      val factor = event.calculateZoom()
+                                      val pan = event.calculatePan()
+                                      val centroid = event.calculateCentroid(useCurrent = true)
+                                      val newZoom = (zoom * factor).coerceIn(0.05f, 10f)
+                                      val docUnder = (centroid - offset) / zoom
+                                      offset = centroid + pan - docUnder * newZoom
+                                      zoom = newZoom
+                                      event.changes.forEach { it.consume() }
+                                  } else if (pressed.size == 1 && !multi) {
+                                      val c = pressed.first()
+                                      val delta = c.positionChange()
+                                      total += delta
+                                      if (!active && total.getDistance() > viewConfiguration.touchSlop) {
+                                          active = true
+                                          if (drag !is Drag.Pan) { vm.beginGesture(); begun = true }
+                                      }
+                                      if (active) {
+                                          val p = toDoc(c.position)
+                                          when (drag) {
+                                              Drag.Pan -> offset += delta
+                                              is Drag.Move -> vm.liveUpdate(
+                                                  drag.start.withTransform(
+                                                      x = drag.start.x + total.x / zoom,
+                                                      y = drag.start.y + total.y / zoom,
+                                                  )
+                                              )
+                                              is Drag.Handle -> vm.liveUpdate(
+                                                  if (drag.type == HandleType.ROTATE) rotateTo(drag.start, p)
+                                                  else resize(drag.start, drag.type, p)
+                                              )
+                                          }
+                                          c.consume()
+                                      }
+                                  }
+                              } while (event.changes.any { it.pressed })
+                              if (begun) vm.endGesture()
+                          }
+                      }
+              ) {
+                  val selected = design.elements.firstOrNull { it.id == state.selectedId }
+                  withTransform({
+                      translate(offset.x, offset.y)
+                      scale(zoom, zoom, Offset.Zero)
+                  }) {
+                      drawRect(Color.White, Offset.Zero, Size(design.width.toFloat(), design.height.toFloat()))
+
+                      // Elementos recortados à página; a ordem da lista é o z-index.
+                      clipRect(0f, 0f, design.width.toFloat(), design.height.toFloat()) {
+                          for (e in design.elements) {
+                              rotate(e.rotation, pivot = e.center()) {
+                                  when (e) {
+                                      is ShapeElement -> drawRoundRect(
+                                          Color(e.color), Offset(e.x, e.y), Size(e.w, e.h), CornerRadius(e.corner)
+                                      )
+                                      is TextElement -> {
+                                          val layout = measurer.measure(
+                                              text = AnnotatedString(e.text),
+                                              style = TextStyle(fontSize = e.fontSize.toSp(), color = Color(e.color)),
+                                              constraints = Constraints(maxWidth = e.w.roundToInt().coerceAtLeast(1)),
+                                          )
+                                          drawText(layout, topLeft = Offset(e.x, e.y))
+                                      }
+                                      is ImageElement -> images[e.path]?.let {
+                                          drawImage(
+                                              it,
+                                              dstOffset = IntOffset(e.x.roundToInt(), e.y.roundToInt()),
+                                              dstSize = IntSize(e.w.roundToInt(), e.h.roundToInt()),
+                                          )
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      // Seleção e alças (fora do recorte, com tamanho constante no ecrã).
+                      selected?.let { s ->
+                          val stroke = 2.dp.toPx() / zoom
+                          val rotDist = 28.dp.toPx() / zoom
+                          val blue = Color(0xFF2979FF)
+                          rotate(s.rotation, pivot = s.center()) {
+                              drawRect(blue, Offset(s.x, s.y), Size(s.w, s.h), style = Stroke(stroke))
+                              drawLine(blue, Offset(s.x + s.w / 2, s.y), Offset(s.x + s.w / 2, s.y - rotDist), stroke)
+                          }
+                          val r = 8.dp.toPx() / zoom
+                          handlePositions(s, rotDist).values.forEach { p ->
+                              drawCircle(Color.White, r, p)
+                              drawCircle(blue, r, p, style = Stroke(stroke))
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/EditorViewModel.kt <<'EOF'
+          package com.example.designeditor
+
+          import android.app.Application
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          data class EditorState(
+              val design: Design = Design(),
+              val selectedId: String? = null,
+              val canUndo: Boolean = false,
+              val canRedo: Boolean = false,
+          )
+
+          class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
+              private val storage = DesignStorage(File(app.filesDir, "designs").apply { mkdirs() })
+              private val undoStack = ArrayDeque<Design>()
+              private val redoStack = ArrayDeque<Design>()
+              private var gestureStart: Design? = null
+              private var saveJob: Job? = null
+
+              private val _state = MutableStateFlow(EditorState())
+              val state: StateFlow<EditorState> = _state.asStateFlow()
+
+              init {
+                  viewModelScope.launch {
+                      storage.load("default")?.let { loaded -> _state.update { it.copy(design = loaded) } }
+                  }
+              }
+
+              private val design get() = _state.value.design
+
+              // ---------- histórico ----------
+              private fun publish(d: Design, selected: String?) {
+                  _state.value = EditorState(d, selected, undoStack.isNotEmpty(), redoStack.isNotEmpty())
+                  scheduleSave()
+              }
+
+              /** Alteração discreta: guarda o estado anterior no histórico. */
+              private fun commit(newDesign: Design, selected: String? = _state.value.selectedId) {
+                  undoStack.addLast(design)
+                  if (undoStack.size > 100) undoStack.removeFirst()
+                  redoStack.clear()
+                  publish(newDesign, selected)
+              }
+
+              fun undo() {
+                  val prev = undoStack.removeLastOrNull() ?: return
+                  redoStack.addLast(design)
+                  publish(prev, _state.value.selectedId?.takeIf { id -> prev.elements.any { it.id == id } })
+              }
+
+              fun redo() {
+                  val next = redoStack.removeLastOrNull() ?: return
+                  undoStack.addLast(design)
+                  publish(next, _state.value.selectedId?.takeIf { id -> next.elements.any { it.id == id } })
+              }
+
+              // ---------- gestos (arrastar/redimensionar/rodar) ----------
+              fun beginGesture() { gestureStart = design }
+
+              /** Atualização em tempo real durante o gesto: sem histórico e sem gravar. */
+              fun liveUpdate(e: Element) {
+                  _state.update { s ->
+                      s.copy(design = s.design.copy(elements = s.design.elements.map { if (it.id == e.id) e else it }))
+                  }
+              }
+
+              /** Quando o dedo levanta, o gesto inteiro vira UM passo de undo. */
+              fun endGesture() {
+                  val start = gestureStart ?: return
+                  gestureStart = null
+                  if (start != design) {
+                      undoStack.addLast(start)
+                      redoStack.clear()
+                      publish(design, _state.value.selectedId)
+                  }
+              }
+
+              // ---------- ações ----------
+              fun select(id: String?) { _state.update { it.copy(selectedId = id) } }
+
+              fun addShape() {
+                  val d = design
+                  val s = ShapeElement(newId(), (d.width - 400) / 2f, (d.height - 400) / 2f, 400f, 400f, color = 0xFF6200EE, corner = 24f)
+                  commit(d.copy(elements = d.elements + s), s.id)
+              }
+
+              fun addText() {
+                  val d = design
+                  val t = TextElement(newId(), (d.width - 600) / 2f, (d.height - 100) / 2f, 600f, 100f, text = "Texto")
+                  commit(d.copy(elements = d.elements + t), t.id)
+              }
+
+              fun addImage(uri: Uri) {
+                  viewModelScope.launch(Dispatchers.IO) {
+                      val dir = File(app.filesDir, "images").apply { mkdirs() }
+                      val f = File(dir, "${newId()}.img")
+                      val ok = app.contentResolver.openInputStream(uri)?.use { i -> f.outputStream().use { o -> i.copyTo(o) }; true } ?: false
+                      if (!ok) return@launch
+                      val b = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      BitmapFactory.decodeFile(f.path, b)
+                      if (b.outWidth <= 0) return@launch
+                      withContext(Dispatchers.Main) {
+                          val d = design
+                          val w = d.width * 0.6f
+                          val h = w * b.outHeight / b.outWidth
+                          val img = ImageElement(newId(), (d.width - w) / 2f, (d.height - h) / 2f, w, h, path = f.path)
+                          commit(d.copy(elements = d.elements + img), img.id)
+                      }
+                  }
+              }
+
+              fun updateText(id: String, text: String) {
+                  val d = design
+                  commit(d.copy(elements = d.elements.map { if (it.id == id && it is TextElement) it.copy(text = text) else it }))
+              }
+
+              fun deleteSelected() {
+                  val id = _state.value.selectedId ?: return
+                  commit(design.copy(elements = design.elements.filterNot { it.id == id }), null)
+              }
+
+              // ---------- persistência ----------
+              private fun scheduleSave() {
+                  saveJob?.cancel()
+                  saveJob = viewModelScope.launch { delay(1000); storage.save(design) }
+              }
+
+              fun saveNow() {
+                  saveJob?.cancel()
+                  viewModelScope.launch { storage.save(design) }
+              }
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/MainActivity.kt <<'EOF'
+          package com.example.designeditor
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.viewModels
+          import androidx.compose.material3.MaterialTheme
+
+          class MainActivity : ComponentActivity() {
+              private val vm: EditorViewModel by viewModels()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { EditorScreen(vm) } }
+              }
+
+              override fun onStop() {
+                  vm.saveNow()
+                  super.onStop()
+              }
+          }
+          EOF
+          mkdir -p DesignEditor/app/src/main/java/com/example/designeditor
+          cat > DesignEditor/app/src/main/java/com/example/designeditor/Model.kt <<'EOF'
+          package com.example.designeditor
+
+          import kotlinx.serialization.SerialName
+          import kotlinx.serialization.Serializable
+          import java.util.UUID
+
+          fun newId(): String = UUID.randomUUID().toString()
+
+          /** Todos os elementos partilham a mesma geometria: caixa (x, y, w, h) + rotação em graus. */
+          @Serializable
+          sealed interface Element {
+              val id: String
+              val x: Float
+              val y: Float
+              val w: Float
+              val h: Float
+              val rotation: Float
+
+              fun withTransform(
+                  x: Float = this.x, y: Float = this.y,
+                  w: Float = this.w, h: Float = this.h,
+                  rotation: Float = this.rotation,
+              ): Element
+          }
+
+          @Serializable @SerialName("shape")
+          data class ShapeElement(
+              override val id: String, override val x: Float, override val y: Float,
+              override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              val color: Long = 0xFF6200EE, val corner: Float = 0f,
+          ) : Element {
+              override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
+                  copy(x = x, y = y, w = w, h = h, rotation = rotation)
+          }
+
+          @Serializable @SerialName("text")
+          data class TextElement(
+              override val id: String, override val x: Float, override val y: Float,
+              override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              val text: String, val fontSize: Float = 64f, val color: Long = 0xFF000000,
+          ) : Element {
+              // Ao redimensionar a altura, o tamanho da fonte acompanha.
+              override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
+                  copy(x = x, y = y, w = w, h = h, rotation = rotation,
+                      fontSize = if (h != this.h && this.h > 0f) fontSize * h / this.h else fontSize)
+          }
+
+          @Serializable @SerialName("image")
+          data class ImageElement(
+              override val id: String, override val x: Float, override val y: Float,
+              override val w: Float, override val h: Float, override val rotation: Float = 0f,
+              val path: String,
+          ) : Element {
+              override fun withTransform(x: Float, y: Float, w: Float, h: Float, rotation: Float) =
+                  copy(x = x, y = y, w = w, h = h, rotation = rotation)
+          }
+
+          /** A ordem da lista é o z-index (o último fica por cima). */
+          @Serializable
+          data class Design(
+              val id: String = "default",
+              val width: Int = 1080,
+              val height: Int = 1080,
+              val elements: List<Element> = emptyList(),
+              val version: Int = 1,
+          )
+          EOF
+          mkdir -p DesignEditor
+          cat > DesignEditor/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.serialization") version "2.0.21" apply false
+          }
+          EOF
+          mkdir -p DesignEditor
+          cat > DesignEditor/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          mkdir -p DesignEditor
+          cat > DesignEditor/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "DesignEditor"
+          include(":app")
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        working-directory: DesignEditor
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: DesignEditor/app/build/outputs/apk/debug/app-debug.apk
